@@ -51,6 +51,7 @@ pub struct RtcConfig {
     pub(crate) pause_threshold: Duration,
     pub(crate) send_buffer_audio: usize,
     pub(crate) send_buffer_video: usize,
+    pub(crate) recycle_stopped_mlines: bool,
     pub(crate) sctp_max_buffered_amount: usize,
     pub(crate) rtp_mode: bool,
     pub(crate) enable_raw_packets: bool,
@@ -681,6 +682,36 @@ impl RtcConfig {
         self.send_buffer_video
     }
 
+    /// Lets offers made with [`SdpApi`][crate::change::SdpApi] put a new m-line in the slot of
+    /// a stopped one (RFC 8829 section 5.2.2), instead of always appending it.
+    ///
+    /// A slot is taken only once its stop has been negotiated: the offer or answer that
+    /// stopped it has completed. Without recycling, every [`SdpApi::stop_media()`] leaves a
+    /// port=0 m-line in the SDP for good, so a session that keeps adding and stopping media
+    /// grows its SDP without bound.
+    ///
+    /// The remote peer must accept a recycled slot in an offer, as browsers do and str0m does
+    /// since 0.18.1. Off by default, since an older peer would reject the offer.
+    ///
+    /// [`SdpApi::stop_media()`]: crate::change::SdpApi::stop_media
+    pub fn set_recycle_stopped_mlines(mut self, enabled: bool) -> Self {
+        self.recycle_stopped_mlines = enabled;
+        self
+    }
+
+    /// Returns whether offers recycle the slots of stopped m-lines.
+    ///
+    /// ```
+    /// # use str0m::Rtc;
+    /// let config = Rtc::builder();
+    ///
+    /// // Defaults to false.
+    /// assert!(!config.recycle_stopped_mlines());
+    /// ```
+    pub fn recycle_stopped_mlines(&self) -> bool {
+        self.recycle_stopped_mlines
+    }
+
     /// Sets how many bytes the data channels can buffer for sending, summed over all channels.
     ///
     /// [`Channel::write()`][crate::channel::Channel::write()] does not accept a message (returns
@@ -893,6 +924,7 @@ impl Default for RtcConfig {
             pause_threshold: Duration::from_millis(1500),
             send_buffer_audio: 50,
             send_buffer_video: 1000,
+            recycle_stopped_mlines: false,
             sctp_max_buffered_amount: crate::sctp::DEFAULT_MAX_BUFFERED_AMOUNT,
             rtp_mode: false,
             enable_raw_packets: false,

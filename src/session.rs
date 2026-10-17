@@ -76,6 +76,7 @@ pub(crate) struct Session {
     intervals: RtcpReportIntervals,
     pub send_buffer_audio: usize,
     pub send_buffer_video: usize,
+    pub recycle_stopped_mlines: bool,
 
     /// Extension mappings are _per BUNDLE_, but we can only have one a=group BUNDLE
     /// in WebRTC (one ice connection), so they are effectively per session.
@@ -188,6 +189,7 @@ impl Session {
             intervals: config.intervals,
             send_buffer_audio: config.send_buffer_audio,
             send_buffer_video: config.send_buffer_video,
+            recycle_stopped_mlines: config.recycle_stopped_mlines,
             exts: config.exts.clone(),
 
             // Both sending and receiving starts from the configured codecs.
@@ -1332,7 +1334,6 @@ impl Session {
         }
     }
 
-    #[allow(dead_code)]
     pub fn line_count(&self) -> usize {
         self.medias.len() + if self.app.is_some() { 1 } else { 0 }
     }

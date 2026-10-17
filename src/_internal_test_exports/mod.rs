@@ -20,6 +20,15 @@ impl Rtc {
     }
 
     /// UNSTABLE: not public API!
+    pub fn _index_of(&self, mid: Mid) -> Option<usize> {
+        self.session
+            .medias
+            .iter()
+            .find(|m| m.mid() == mid)
+            .map(Media::index)
+    }
+
+    /// UNSTABLE: not public API!
     pub fn _exts(&self) -> &ExtensionMap {
         &self.session.exts
     }

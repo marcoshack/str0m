@@ -840,18 +840,24 @@ fn as_sdp(session: &Session, params: AsSdpParams) -> Sdp {
 
         let mut new_lines = vec![];
 
-        // When creating new m-lines from the pending changes, the m-line index starts from this.
-        let new_index_start = v.len();
-
-        // If there are additions in the pending changes, prepend them now.
+        // If there are additions in the pending changes, make their m-lines now, each at the
+        // index it takes: a recycled slot or the end.
         if let Some(pending) = params.pending {
+            let indices = new_line_indices(session, pending);
             new_lines = pending
-                .as_new_medias(new_index_start, &session.codec_config, &session.exts)
+                .as_new_medias(&indices, &session.codec_config, &session.exts)
                 .collect();
         }
 
-        // Add potentially new m-lines to the existing ones.
-        v.extend(new_lines.iter().map(|n| n as &dyn AsSdpMediaLine));
+        // A new m-line in a recycled slot replaces the stopped one there; the others are
+        // appended, in index order.
+        for n in &new_lines {
+            let n = n as &dyn AsSdpMediaLine;
+            match v.iter().position(|l| l.index() == n.index()) {
+                Some(pos) => v[pos] = n,
+                None => v.push(n),
+            }
+        }
 
         // Turn into sdp::MediaLine (m-line).
         let mut lines = v
@@ -949,7 +955,7 @@ fn apply_offer(session: &mut Session, offer: SdpOffer) -> Result<(), RtcError> {
     update_session(session, &offer);
 
     let bundle_mids = offer.bundle_mids();
-    let new_lines = sync_medias(session, &offer, true).map_err(RtcError::RemoteSdp)?;
+    let new_lines = sync_medias(session, &offer, true, &[]).map_err(RtcError::RemoteSdp)?;
 
     add_new_lines(session, &new_lines, true, bundle_mids).map_err(RtcError::RemoteSdp)?;
 
@@ -968,7 +974,8 @@ fn apply_answer(
     update_session(session, &answer);
 
     let bundle_mids = answer.bundle_mids();
-    let new_lines = sync_medias(session, &answer, false).map_err(RtcError::RemoteSdp)?;
+    let recycled = recycled_slots(session, &pending);
+    let new_lines = sync_medias(session, &answer, false, &recycled).map_err(RtcError::RemoteSdp)?;
 
     // The new_lines from the answer must correspond to what we sent in the offer.
     if let Some(err) = pending.ensure_correct_answer(&new_lines) {
@@ -1043,6 +1050,60 @@ fn ensure_stream_tx(session: &mut Session) {
     }
 }
 
+/// The m-line index each new m-line of `changes` takes in our offer, in the order of the
+/// AddMedia / AddApp entries: with [`RtcConfig::set_recycle_stopped_mlines`] on, each AddMedia
+/// takes the lowest slot of a stopped m-line whose stop has been negotiated
+/// (RFC 8829 section 5.2.2), and every other new m-line is appended.
+///
+/// It depends only on the session's m-lines and the order of `changes`, neither of which an
+/// offer changes until its answer is accepted, so the answer is checked against the same
+/// indices the offer was made with ([`recycled_slots`]).
+///
+/// [`RtcConfig::set_recycle_stopped_mlines`]: crate::RtcConfig::set_recycle_stopped_mlines
+fn new_line_indices(session: &Session, changes: &Changes) -> Vec<usize> {
+    let mut free: Vec<usize> = if session.recycle_stopped_mlines {
+        session
+            .medias()
+            .iter()
+            .filter(|m| m.is_recyclable())
+            .map(|m| m.index())
+            .collect()
+    } else {
+        vec![]
+    };
+    // Lowest first, taken from the back.
+    free.sort_unstable_by(|a, b| b.cmp(a));
+
+    let mut next = session.line_count();
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::AddMedia(_) => Some(free.pop().unwrap_or_else(|| {
+                next += 1;
+                next - 1
+            })),
+            Change::AddApp(_) => {
+                next += 1;
+                Some(next - 1)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The (mid, index) of every new m-line our offer of `changes` put in a recycled slot.
+fn recycled_slots(session: &Session, changes: &Changes) -> Vec<(Mid, usize)> {
+    let count = session.line_count();
+    let mids = changes.iter().filter_map(|c| match c {
+        Change::AddMedia(v) => Some(Some(v.mid)),
+        Change::AddApp(_) => Some(None),
+        _ => None,
+    });
+    mids.zip(new_line_indices(session, changes))
+        .filter_map(|(mid, index)| (index < count).then_some((mid?, index)))
+        .collect()
+}
+
 fn add_pending_changes(session: &mut Session, pending: Changes) {
     // For pending AddMedia, we have outgoing SSRC communicated that needs to be added.
     for change in pending.0 {
@@ -1087,12 +1148,15 @@ fn add_pending_changes(session: &mut Session, pending: Changes) {
 /// * Existing m-lines can apply changes (such as direction change).
 /// * New m-lines are returned to the caller paired with the session
 ///   index they should occupy. The index is normally the next free slot,
-///   but can be a recycled slot (RFC 8829 §5.2.2) when the remote has
-///   replaced a previously disabled Media with a new mid.
+///   but can be a recycled slot (RFC 8829 §5.2.2) when the remote's offer
+///   replaced a previously disabled Media with a new mid, or when the
+///   answer confirms a slot our own offer recycled (`recycled`, as
+///   (mid, index) pairs; always empty for an offer).
 fn sync_medias<'a>(
     session: &mut Session,
     sdp: &'a Sdp,
     is_offer: bool,
+    recycled: &[(Mid, usize)],
 ) -> Result<Vec<(usize, &'a MediaLine)>, String> {
     let mut new_lines = Vec::with_capacity(sdp.media_lines.len());
     let bundle_mids = sdp.bundle_mids();
@@ -1123,15 +1187,23 @@ fn sync_medias<'a>(
                         bundle_mids,
                     );
 
+                    // Our answer carries a stopped m-line as port 0, which completes its
+                    // stop even if the offer that first stopped it was never answered
+                    // (glare, or an offer of ours overtaken by the remote's).
+                    if is_offer && media.stopped() {
+                        media.mark_stop_negotiated();
+                    }
+
                     continue;
                 }
 
                 // Unknown mid at an index held by a disabled Media means
                 // the remote has recycled the slot (RFC 8829 §5.2.2).
-                // Recycling is only permitted in offers; an answer that
-                // rewires a mid at a stopped slot is malformed.
+                // Recycling is only permitted in offers; an answer may
+                // only confirm a slot our own offer recycled, and one
+                // that rewires any other stopped slot is malformed.
                 if let Some(pos) = session.medias.iter().position(|l| l.index() == idx) {
-                    if !is_offer {
+                    if !is_offer && !recycled.contains(&(m.mid(), idx)) {
                         return Err(format!(
                             "Answer recycles stopped m-line (not permitted per RFC 8829 §5.2.2): {}",
                             m.mid()
@@ -1150,7 +1222,18 @@ fn sync_medias<'a>(
             }
         }
 
-        // Second, discover new m-lines.
+        // Second, discover new m-lines. A mid our offer put in a recycled slot must be
+        // answered in that slot.
+        if let Some((_, at)) = recycled.iter().find(|(mid, _)| *mid == m.mid()) {
+            if *at != idx {
+                return Err(format!(
+                    "Answer moved recycled m-line {} from index {} to {}",
+                    m.mid(),
+                    at,
+                    idx
+                ));
+            }
+        }
         new_lines.push((idx, m));
     }
 
@@ -1280,6 +1363,9 @@ fn update_media(
             );
         }
         media.mark_stopped();
+        // The remote's offer or answer shows the m-line rejected, so once this exchange
+        // completes both sides hold it stopped, and its slot can be recycled.
+        media.mark_stop_negotiated();
         media.set_direction(Direction::Inactive);
         return;
     }
@@ -1771,19 +1857,22 @@ impl Changes {
             .count()
     }
 
+    /// The new m-lines of these changes, the n-th AddMedia / AddApp at `indices[n]`
+    /// ([`new_line_indices`]).
     pub fn as_new_medias<'a, 'b: 'a>(
         &'a self,
-        index_start: usize,
+        indices: &'a [usize],
         config: &'b CodecConfig,
         exts: &'b ExtensionMap,
     ) -> impl Iterator<Item = Media> + 'a {
         // Use a separate counter that only advances for entries that actually produce
         // an m-line (AddMedia / AddApp).  Non-media entries (Direction, IceRestart,
         // AddChannel) must not consume an index slot, otherwise the resulting m-line
-        // indices would be non-contiguous and out of sync with their array positions.
+        // indices would be out of sync with the changes that take them.
         let mut media_idx = 0usize;
         self.0.iter().filter_map(move |c| {
-            let result = c.as_new_media(index_start + media_idx, config, exts);
+            let index = *indices.get(media_idx)?;
+            let result = c.as_new_media(index, config, exts);
             if result.is_some() {
                 media_idx += 1;
             }
@@ -2055,7 +2144,8 @@ mod test {
         let config = CodecConfig::new_with_defaults();
         let exts = ExtensionMap::standard();
 
-        let medias: Vec<Media> = changes.as_new_medias(0, &config, &exts).collect();
+        let indices = new_line_indices(&rtc.session, &changes);
+        let medias: Vec<Media> = changes.as_new_medias(&indices, &config, &exts).collect();
 
         // Should produce two Media objects: one for AddApp, one for AddMedia(audio).
         assert_eq!(medias.len(), 2, "Expected 2 media-producing entries");

@@ -114,6 +114,10 @@ pub struct Media {
     /// (the SDP grammar requires at least one fmt on a port=0 m-line).
     stopped: bool,
 
+    /// Set once the offer/answer exchange that stopped this m-line has completed, which
+    /// makes its slot free for a new m-line in our next offer (RFC 8829 section 5.2.2).
+    stop_negotiated: bool,
+
     /// Remote extmaps negotiated for this media.
     ///
     /// The corresponding entries must exist in Session::codec_config.
@@ -338,6 +342,16 @@ impl Media {
 
     pub(crate) fn mark_stopped(&mut self) {
         self.stopped = true;
+    }
+
+    /// Whether our next offer may put a new m-line in this one's slot: it is stopped,
+    /// and the exchange that stopped it has completed.
+    pub(crate) fn is_recyclable(&self) -> bool {
+        self.stopped && self.stop_negotiated
+    }
+
+    pub(crate) fn mark_stop_negotiated(&mut self) {
+        self.stop_negotiated = true;
     }
 
     pub(crate) fn simulcast(&self) -> Option<&SdpSimulcast> {
@@ -714,6 +728,7 @@ impl Default for Media {
             kind: MediaKind::Video,
             remote_pts: vec![],
             stopped: false,
+            stop_negotiated: false,
             remote_exts: ExtensionMap::empty(),
             remote_created: false,
             dir: Direction::SendRecv,

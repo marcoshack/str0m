@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Recycle negotiated stopped m-line slots in our own offers, behind `RtcConfig::set_recycle_stopped_mlines` (RFC 8829 section 5.2.2)
+
 # 0.24.1
 
   * Make the SCTP send buffer limit configurable and fix polling stack overflow #1062
