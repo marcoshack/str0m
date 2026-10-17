@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Recycle negotiated stopped m-line slots in our own offers, behind `RtcConfig::set_recycle_stopped_mlines` (RFC 8829 section 5.2.2)
+
   * Exclude recovered RTX packets from primary stream jitter reports #1121
   * Allow disabling BWE estimate smoothing #1119
 
